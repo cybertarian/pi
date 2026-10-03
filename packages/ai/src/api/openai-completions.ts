@@ -39,7 +39,7 @@ import { formatProviderError, normalizeProviderError } from "../utils/error-body
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { headersToRecord } from "../utils/headers.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
+import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
@@ -380,6 +380,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 
 			interface StreamingToolCallBlock extends ToolCall {
 				partialArgs?: string;
+				argsComplete?: boolean;
 				customInput?: {
 					property: string;
 					jsonBuffer: GrammarToolInputJsonBuffer;
@@ -459,7 +460,9 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 						block.arguments = parseStreamingJson(block.partialArgs);
 					}
 					// Finalize in-place and strip the scratch buffers so replay only
-					// carries parsed arguments.
+					// carries parsed arguments. argsComplete survives finishBlock on
+					// purpose: the error path below needs it to tell which tool calls
+					// streamed complete JSON before the stream died.
 					delete block.partialArgs;
 					delete block.customInput;
 					delete block.streamIndex;
@@ -649,9 +652,20 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 								delta = toolCall.function.arguments;
 								block.partialArgs = (block.partialArgs ?? "") + toolCall.function.arguments;
 								block.arguments = parseStreamingJson(block.partialArgs);
+								// Track whether the accumulated raw arguments are fully closed
+								// JSON. A truncated stream must not persist tool calls whose
+								// arguments never completed (they would surface as empty-argument
+								// calls in session logs).
+								try {
+									parseJsonWithRepair(block.partialArgs);
+									block.argsComplete = true;
+								} catch {
+									block.argsComplete = false;
+								}
 							} else if (toolCall.custom?.input) {
 								const nextInput = getCustomToolCallInput(block) + toolCall.custom.input;
 								delta = appendCustomToolCallInput(block, nextInput, false) ?? "";
+								block.argsComplete = block.customInput?.jsonBuffer.closed === true;
 							}
 							stream.push({
 								type: "toolcall_delta",
@@ -697,9 +711,26 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				throw new Error("Stream ended without finish_reason");
 			}
 
+			// Scratch fields must not leak into the persisted message.
+			for (const block of blocks) {
+				if (block.type === "toolCall") {
+					delete block.argsComplete;
+				}
+			}
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
+			// A truncated stream can leave tool-call blocks whose arguments never
+			// finished. Those blocks cannot be executed and would persist into
+			// session logs as bogus empty-argument calls, so drop every tool call
+			// that never received fully-parsed arguments. Text and thinking blocks
+			// are kept so the error context stays readable.
+			for (let index = output.content.length - 1; index >= 0; index -= 1) {
+				const block = output.content[index];
+				if (block && block.type === "toolCall" && !(block as { argsComplete?: boolean }).argsComplete) {
+					output.content.splice(index, 1);
+				}
+			}
 			for (const block of output.content) {
 				if (block.type === "thinking") {
 					applyStreamedReasoningDetails(block);
@@ -707,6 +738,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				delete (block as { index?: number }).index;
 				// Streaming scratch buffers are only used during parsing; never persist them.
 				delete (block as { partialArgs?: string }).partialArgs;
+				delete (block as { argsComplete?: boolean }).argsComplete;
 				delete (block as { customInput?: unknown }).customInput;
 				delete (block as { streamIndex?: number }).streamIndex;
 			}
