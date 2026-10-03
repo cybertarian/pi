@@ -90,6 +90,8 @@ describe("openai-completions truncated stream tool-call handling", () => {
 		mockState.chunks = [];
 	});
 
+	// Regression tests for https://github.com/earendil-works/pi/issues/10435
+
 	it("drops a tool call that received no argument deltas before the stream ended without finish_reason", async () => {
 		// Provider drops the connection right after the tool call starts:
 		// the block exists but its arguments never stream (partialArgs stays empty).
